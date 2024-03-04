@@ -5,6 +5,8 @@ const router = new Router();
 const multiparty = require("multiparty");
 // fs拓展
 const fse = require("fs-extra");
+const fs = require("fs");
+const rimraf = require("rimraf");
 
 const UPLOAD_DIR = path.resolve(__dirname, "../", "upload");
 
@@ -12,27 +14,39 @@ const UPLOAD_DIR = path.resolve(__dirname, "../", "upload");
 function multipartParse(ctx) {
   const multipart = new multiparty.Form();
   return new Promise((resolve, reject) => {
+
     multipart.parse(ctx.req, async (err, fields, files) => {
       if (err) {
         reject({
           code: 500,
           msg: "解析切片失败",
         });
+        // 本应该reject后终止，却没有
+        return
       }
-      
-      const [chunk] = files.chunk;
-      const [hash] = fields.hash;
-      const [filename] = fields.filename;
 
-      const chunkDir = path.resolve(UPLOAD_DIR, "chunkDir_" + filename);
+      /* 取出前端请求中相应的字段数据 */
+      console.log("debugger", files);
+      const [chunk] = files.chunk;
+      // const [hash] = fields.hash;
+      // const [filename] = fields.filename;
+      const [fileHash] = fields.fileHash;
+      const [index] = fields.index;
+
+      const chunkDir = path.resolve(UPLOAD_DIR, "chunkDir_" + fileHash);
 
       if (!fse.existsSync(chunkDir)) {
         await fse.mkdirs(chunkDir);
       }
 
       // fs-extra 中的 move 方法可以实现文件移动的功能
-      if (!`${chunkDir}/${hash}`)
-        await fse.move(chunk.path, `${chunkDir}/${hash}`);
+
+      // 判断chunkDir下是否存在hash文件
+      /* 若指定文件内已经有，则更新；若没有，则增加 */
+      if (!fse.existsSync(`${chunkDir}/${fileHash}-${index}`))
+        await fse.move(chunk.path, `${chunkDir}/${fileHash}-${index}`);
+      // else console.log(`${chunkDir}/${hash}切片存在，跳过`)
+
       resolve({
         code: 200,
         msg: "上传切片成功",
@@ -42,22 +56,22 @@ function multipartParse(ctx) {
 }
 
 /**
- * 工具函数：在指定文件位置，写入文件流 
+ * 工具函数：在指定文件位置，写入文件流
  * @param {path} 文件路径
  * @param {writeStream} 文件写入流
-*/
-function pipeStream(path, writeStream){
-  new Promise(resolve => {
+ */
+function pipeStream(path, writeStream) {
+  new Promise((resolve) => {
     // 创建读取流，读取指定文件
     const readSteam = fse.createReadStream(path);
     // 读取流通过管道写入文件流中
-    readSteam.pipe(writeStream)
-    readSteam.on('end', () => {
+    readSteam.pipe(writeStream);
+    readSteam.on("end", () => {
       // 完成后删除原始文件
-      fse.unlinkSync(path)
-      resolve()
-    })
-  })
+      // fse.unlink(path);
+      resolve();
+    });
+  });
 }
 
 /**
@@ -66,25 +80,33 @@ function pipeStream(path, writeStream){
  * @param {filename} 文件名
  * @param {size} 文件大小
  * */
-async function mergeFileChunk(filePath, filename, size){
-    const chunkDir = path.resolve(UPLOAD_DIR, "chunkDir_" + filename)
-    // 获取文件切片
-    const chunkPaths = await fse.readdir(chunkDir)
+async function mergeFileChunk(filePath, fileHash, size) {
+  const chunkDir = path.resolve(UPLOAD_DIR, "chunkDir_" + fileHash);
+  // 获取文件切片
+  const chunkPaths = await fse.readdir(chunkDir);
 
-    chunkPaths.sort((a, b) => a.split('-')[1] - b.split('-')[1])
-    
-    // 并发写入
-    await Promise.all(
-      chunkPaths.map((chunkPath, index) => 
-        pipeStream(path.resolve(chunkDir, chunkPath),  fse.createWriteStream(filePath, {
-            // 指定位置创建写入
-            start: index * size,
-        }))) 
-    )
+  chunkPaths.sort((a, b) => a.split("-")[1] - b.split("-")[1]);
 
-    // 合并所有切片成功后，删除切片文件夹
-    fse.rmdirSync(chunkDir)
+  // 并发写入
+  await Promise.all(
+    chunkPaths.map((chunkPath, index) => {
+      console.log(`合并顺序：${index}, 合并位置：${index*size}`)
+      return pipeStream(
+        path.resolve(chunkDir, chunkPath),
+        fse.createWriteStream(filePath, {
+          // 指定位置创建写入
+          start: index * size,
+        })
+      );
+    })
+  );
 
+  // await fse.remove(chunkDir);
+
+  // 合并所有切片成功后，删除切片文件夹
+  setTimeout(() => {
+    fse.removeSync(chunkDir);
+  }, 2000);
 }
 
 /* 上传文件切片 */
@@ -95,7 +117,7 @@ router.post("/upload", async (ctx, next) => {
   try {
     const res = await multipartParse(ctx);
 
-    console.log("res", res);
+    console.log("chunk res", res);
     ctx.response.status = 200;
     ctx.response.body = {
       ...res,
@@ -120,15 +142,58 @@ router.post("/upload", async (ctx, next) => {
 router.post("/merge", async (ctx, next) => {
   // 设置跨域
   ctx.set("Access-Control-Allow-Origin", "*");
-  ctx.set("Access-Control-Allow-Headers", "*")
-  // 获取请求中的body数据
+  ctx.set("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
 
-  ctx.body = {
-    code: 200,
-    msg: "合并切片成功",
-    data: null,
-  };
+  console.log("merge", ctx.request.body);
+  const multipart = new multiparty.Form();
+  const fields = await new Promise((resolve, reject) => {
+    multipart.parse(ctx.req, async (err, fields, files) => {
+      resolve(fields);
+    });
+  });
+  console.log("fields", fields);
+
+  try {
+    // const [filename] = fields.filename;
+    const [fileHash] = fields.fileHash
+    const [size] = fields.size;
+    const [suffix] = fields.suffix;
+    const filePath = path.resolve(UPLOAD_DIR, `${fileHash}.${suffix}`);
+    await mergeFileChunk(filePath, fileHash, size);
+    const res = {
+      code: 200,
+      msg: "合并切片成功",
+    };
+    console.log("merge res", res);
+    ctx.body = {
+      ...res,
+      data: null,
+    };
+  } catch (error) {
+    console.log(error);
+    ctx.body = {
+      code: 500,
+      msg: "合并故障",
+      data: null,
+    };
+  }
+
   await next();
 });
+
+/* 验证文件是否存在 */
+router.get('/verify', async (ctx, next) => {
+  ctx.set("Access-Control-Allow-Origin", "*");
+  const { filename } = ctx.query;
+  console.log('query', ctx.query)
+  const filePath = path.resolve(UPLOAD_DIR, filename);
+  const isExist = fse.existsSync(filePath);
+  ctx.body = {
+    code: 200,
+    msg: '验证成功',
+    data: isExist
+  }
+  await next()
+})
 
 module.exports = router;
